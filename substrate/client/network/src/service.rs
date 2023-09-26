@@ -39,7 +39,7 @@ use crate::{
 	network_state::{
 		NetworkState, NotConnectedPeer as NetworkStateNotConnectedPeer, Peer as NetworkStatePeer,
 	},
-	peer_store::{PeerStoreHandle, PeerStoreProvider},
+	peer_store::{PeerStore, PeerStoreHandle, PeerStoreProvider},
 	protocol::{self, NotifsHandlerError, Protocol, Ready},
 	protocol_controller::{self, ProtoSetConfig, ProtocolController, SetId},
 	request_responses::{IfDisconnected, ProtocolConfig as RequestResponseConfig, RequestFailure},
@@ -104,7 +104,8 @@ pub use libp2p::identity::{DecodingError, Keypair, PublicKey};
 pub use protocol::NotificationsSink;
 
 mod metrics;
-mod out_events;
+
+pub(crate) mod out_events;
 
 pub mod signature;
 pub mod traits;
@@ -140,7 +141,7 @@ pub struct NetworkService<B: BlockT + 'static, H: ExHashT> {
 	/// Shortcut to sync protocol handle (`protocol_handles[0]`).
 	sync_protocol_handle: protocol_controller::ProtocolHandle,
 	/// Handle to `PeerStore`.
-	peer_store_handle: PeerStoreHandle,
+	peer_store_handle: Arc<dyn PeerStoreProvider>,
 	/// Marker to pin the `H` generic. Serves no purpose except to not break backwards
 	/// compatibility.
 	_marker: PhantomData<H>,
@@ -157,6 +158,7 @@ where
 	type NotificationProtocolConfig = NonDefaultSetConfig;
 	type RequestResponseProtocolConfig = RequestResponseConfig;
 	type NetworkService<Block, Hash> = Arc<NetworkService<B, H>>;
+	type PeerStore = PeerStore;
 
 	fn new(params: Params<B, H, Self>) -> Result<Self, Error>
 	where
@@ -168,6 +170,11 @@ where
 	/// Get handle to `NetworkService` of the `NetworkBackend`.
 	fn network_service(&self) -> Self::NetworkService<B, H> {
 		self.service.clone()
+	}
+
+	/// Create `PeerStore`.
+	fn peer_store(bootnodes: Vec<sc_network_types::PeerId>) -> Self::PeerStore {
+		PeerStore::new(bootnodes.into_iter().map(From::from).collect())
 	}
 
 	/// Create notification protocol configuration.
@@ -366,7 +373,7 @@ where
 					SetId::from(set_id),
 					proto_set_config,
 					to_notifications.clone(),
-					Box::new(params.peer_store.clone()),
+					params.peer_store.clone(),
 				)
 			})
 			.unzip();
@@ -882,7 +889,36 @@ where
 	H: ExHashT,
 {
 	fn sign_with_local_identity(&self, msg: Vec<u8>) -> Result<Signature, SigningError> {
-		Signature::sign_message(AsRef::<[u8]>::as_ref(&msg), &self.local_identity)
+		let public_key = self.local_identity.public();
+		let bytes = self.local_identity.sign(msg.as_ref())?;
+
+		Ok(Signature {
+			public_key: crate::service::signature::PublicKey::Libp2p(public_key),
+			bytes,
+		})
+		// Ok(Signature {
+		// 	public_key: crate::service::signature::PublicKey::Litep2p(
+		// 		litep2p::crypto::PublicKey::Ed25519(public_key),
+		// 	),
+		// 	bytes,
+		// })
+		// todo!();
+		// // Ok(Self { public_key, bytes })
+		// Signature::sign_message(AsRef::<[u8]>::as_ref(&msg), &self.local_identity)
+	}
+
+	fn verify(
+		&self,
+		peer_id: sc_network_types::PeerId,
+		public_key: &Vec<u8>,
+		signature: &Vec<u8>,
+		message: &Vec<u8>,
+	) -> Result<bool, ()> {
+		let public_key = PublicKey::try_decode_protobuf(&public_key).map_err(|_| ())?;
+		let peer_id: PeerId = peer_id.into();
+		let remote: libp2p::PeerId = public_key.to_peer_id();
+
+		Ok(peer_id == remote && public_key.verify(message, signature))
 	}
 }
 
@@ -1352,7 +1388,7 @@ where
 	/// that peer. Shared with the [`NetworkService`].
 	peers_notifications_sinks: Arc<Mutex<HashMap<(PeerId, ProtocolName), NotificationsSink>>>,
 	/// Peer reputation store handle.
-	peer_store_handle: PeerStoreHandle,
+	peer_store_handle: Arc<dyn PeerStoreProvider>,
 	/// Marker to pin the `H` generic. Serves no purpose except to not break backwards
 	/// compatibility.
 	_marker: PhantomData<H>,
@@ -1412,9 +1448,9 @@ where
 			{
 				metrics.kademlia_records_sizes_total.set(num_entries as u64);
 			}
-			metrics
-				.peerset_num_discovered
-				.set(self.peer_store_handle.num_known_peers() as u64);
+			// metrics
+			// 	.peerset_num_discovered
+			// 	.set(self.peer_store_handle.num_known_peers() as u64);
 			metrics.pending_connections.set(
 				Swarm::network_info(&self.network_service).connection_counters().num_pending()
 					as u64,
@@ -1569,10 +1605,10 @@ where
 						.behaviour_mut()
 						.add_self_reported_address_to_dht(&peer_id, &protocols, addr);
 				}
-				self.peer_store_handle.add_known_peer(peer_id);
+				self.peer_store_handle.add_known_peer(peer_id.into());
 			},
 			SwarmEvent::Behaviour(BehaviourOut::Discovered(peer_id)) => {
-				self.peer_store_handle.add_known_peer(peer_id);
+				self.peer_store_handle.add_known_peer(peer_id.into());
 			},
 			SwarmEvent::Behaviour(BehaviourOut::RandomKademliaStarted) => {
 				if let Some(metrics) = self.metrics.as_ref() {

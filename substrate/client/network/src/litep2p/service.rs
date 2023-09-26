@@ -20,11 +20,14 @@
 
 use crate::{
 	config::MultiaddrWithPeerId,
+	litep2p::shim::notification::peerset::PeersetCommand,
+	multiaddr::Protocol,
+	network_state::NetworkState,
 	peer_store::{PeerStoreHandle, PeerStoreProvider},
-	service::traits::NetworkService,
-	Event, IfDisconnected, NetworkDHTProvider, NetworkEventStream, NetworkPeers, NetworkRequest,
-	NetworkSigner, NetworkStateInfo, NetworkStatus, NetworkStatusProvider, ProtocolName,
-	RequestFailure, Signature,
+	service::{out_events, traits::NotificationSender},
+	Event, IfDisconnected, NetworkDHTProvider, NetworkEventStream, NetworkNotification,
+	NetworkPeers, NetworkRequest, NetworkSigner, NetworkStateInfo, NetworkStatus,
+	NetworkStatusProvider, NotificationSenderError, ProtocolName, RequestFailure, Signature,
 };
 
 use codec::DecodeAll;
@@ -39,7 +42,10 @@ use sc_network_common::{
 use sc_network_types::PeerId;
 use sc_utils::mpsc::TracingUnboundedSender;
 
-use std::collections::HashSet;
+use std::{
+	collections::{HashMap, HashSet},
+	sync::Arc,
+};
 
 /// Logging target for the file.
 const LOG_TARGET: &str = "sub-libp2p";
@@ -49,13 +55,111 @@ const LOG_TARGET: &str = "sub-libp2p";
 #[derive(Debug)]
 pub enum NetworkServiceCommand {
 	/// Get value from DHT.
-	GetValue(KademliaKey),
+	GetValue {
+		/// Record key.
+		key: KademliaKey,
+	},
 
 	/// Put value to DHT.
-	PutValue(KademliaKey, Vec<u8>),
+	PutValue {
+		/// Record key.
+		key: KademliaKey,
+		/// Record value.
+		value: Vec<u8>,
+	},
 
 	/// Query network status.
-	Status(oneshot::Sender<NetworkStatus>),
+	Status {
+		/// `oneshot::Sender` for sending the status.
+		tx: oneshot::Sender<NetworkStatus>,
+	},
+
+	/// Send request to remote peer.
+	StartRequest {
+		/// Peer Id.
+		peer: PeerId,
+
+		/// Protocol.
+		protocol: ProtocolName,
+
+		/// Request.
+		request: Vec<u8>,
+
+		/// Oneshot channel for sending the response.
+		tx: oneshot::Sender<Result<Vec<u8>, RequestFailure>>,
+
+		/// Whether the dial or immediately fail the request if `peer` is not connected.
+		connect: IfDisconnected,
+	},
+
+	/// Add `peers` to `protocol`'s reserved set.
+	AddPeersToReservedSet {
+		/// Protocol.
+		protocol: ProtocolName,
+
+		/// Reserved peers.
+		peers: HashSet<Multiaddr>,
+	},
+
+	/// Report peer.
+	ReportPeer {
+		/// Peer ID.
+		peer: PeerId,
+
+		/// Reputation change.
+		cost_benefit: ReputationChange,
+	},
+
+	/// Add known address for peer.
+	AddKnownAddress {
+		/// Peer ID.
+		peer: PeerId,
+
+		/// Address.
+		address: Multiaddr,
+	},
+
+	/// Set reserved peers for `protocol`.
+	SetReservedPeers {
+		/// Protocol.
+		protocol: ProtocolName,
+
+		/// Reserved peers.
+		peers: HashSet<Multiaddr>,
+	},
+
+	/// Disconnect peer from protocol.
+	DisconnectPeer {
+		/// Protocol.
+		protocol: ProtocolName,
+
+		/// Peer ID.
+		peer: PeerId,
+	},
+
+	/// Set protocol to reserved only (true/false) mode.
+	SetReservedOnly {
+		/// Protocol.
+		protocol: ProtocolName,
+
+		/// Reserved only?
+		reserved_only: bool,
+	},
+
+	/// Remove reserved peers from protocol.
+	RemoveReservedPeers {
+		/// Protocol.
+		protocol: ProtocolName,
+
+		/// Peers to remove from the reserved set.
+		peers: HashSet<PeerId>,
+	},
+
+	/// Create event stream for DHT events.
+	EventStream {
+		/// Sender for the events.
+		tx: out_events::Sender,
+	},
 }
 
 /// `NetworkService` implementation for `litep2p`.
@@ -71,7 +175,13 @@ pub struct Litep2pNetworkService {
 	cmd_tx: TracingUnboundedSender<NetworkServiceCommand>,
 
 	/// Handle to `PeerStore`.
-	peer_store_handle: PeerStoreHandle,
+	peer_store_handle: Arc<dyn PeerStoreProvider>,
+
+	/// Peerset handles.
+	peerset_handles: HashMap<ProtocolName, TracingUnboundedSender<PeersetCommand>>,
+
+	/// Name for the block announce protocol.
+	block_announce_protocol: ProtocolName,
 }
 
 impl Litep2pNetworkService {
@@ -80,107 +190,197 @@ impl Litep2pNetworkService {
 		local_peer_id: litep2p::PeerId,
 		keypair: Keypair,
 		cmd_tx: TracingUnboundedSender<NetworkServiceCommand>,
-		peer_store_handle: PeerStoreHandle,
+		peer_store_handle: Arc<dyn PeerStoreProvider>,
+		peerset_handles: HashMap<ProtocolName, TracingUnboundedSender<PeersetCommand>>,
+		block_announce_protocol: ProtocolName,
 	) -> Self {
-		Self { local_peer_id, keypair, cmd_tx, peer_store_handle }
+		Self {
+			local_peer_id,
+			keypair,
+			cmd_tx,
+			peer_store_handle,
+			peerset_handles,
+			block_announce_protocol,
+		}
 	}
 }
 
-impl NetworkService for Litep2pNetworkService {}
-
 impl NetworkSigner for Litep2pNetworkService {
-	fn sign_with_local_identity(&self, _msg: impl AsRef<[u8]>) -> Result<Signature, SigningError> {
-		let _public_key = self.keypair.public();
-		todo!();
-		// let bytes = self.keypair.sign(message.as_ref())?;
-		// Ok(Signature { public_key, bytes })
+	fn sign_with_local_identity(&self, msg: Vec<u8>) -> Result<Signature, SigningError> {
+		let public_key = self.keypair.public();
+		let bytes = self.keypair.sign(msg.as_ref());
+
+		Ok(Signature {
+			public_key: crate::service::signature::PublicKey::Litep2p(
+				litep2p::crypto::PublicKey::Ed25519(public_key),
+			),
+			bytes,
+		})
+	}
+
+	fn verify(
+		&self,
+		peer: PeerId,
+		public_key: &Vec<u8>,
+		signature: &Vec<u8>,
+		message: &Vec<u8>,
+	) -> Result<bool, ()> {
+		let public_key =
+			litep2p::crypto::PublicKey::from_protobuf_encoding(&public_key).map_err(|_| ())?;
+		let peer: litep2p::PeerId = peer.into();
+
+		Ok(peer == public_key.to_peer_id() && public_key.verify(message, signature))
 	}
 }
 
 impl NetworkDHTProvider for Litep2pNetworkService {
 	fn get_value(&self, key: &KademliaKey) {
-		let _ = self.cmd_tx.unbounded_send(NetworkServiceCommand::GetValue(key.clone()));
+		let _ = self.cmd_tx.unbounded_send(NetworkServiceCommand::GetValue { key: key.clone() });
 	}
 
 	fn put_value(&self, key: KademliaKey, value: Vec<u8>) {
-		let _ = self.cmd_tx.unbounded_send(NetworkServiceCommand::PutValue(key, value));
+		let _ = self.cmd_tx.unbounded_send(NetworkServiceCommand::PutValue { key, value });
 	}
 }
 
-// Manual implementation to avoid extra boxing here
 #[async_trait::async_trait]
 impl NetworkStatusProvider for Litep2pNetworkService {
 	async fn status(&self) -> Result<NetworkStatus, ()> {
 		let (tx, rx) = oneshot::channel();
-		self.cmd_tx.unbounded_send(NetworkServiceCommand::Status(tx)).map_err(|_| ())?;
+		self.cmd_tx
+			.unbounded_send(NetworkServiceCommand::Status { tx })
+			.map_err(|_| ())?;
 
 		rx.await.map_err(|_| ())
+	}
+
+	async fn network_state(&self) -> Result<NetworkState, ()> {
+		// TODO(aaro): implement
+		Ok(NetworkState {
+			peer_id: self.local_peer_id.to_base58(),
+			listened_addresses: HashSet::new(),
+			external_addresses: HashSet::new(),
+			connected_peers: HashMap::new(),
+			not_connected_peers: HashMap::new(),
+			// TODO: Check what info we can include here.
+			//       Issue reference: https://github.com/paritytech/substrate/issues/14160.
+			peerset: serde_json::json!(
+				"Unimplemented. See https://github.com/paritytech/substrate/issues/14160."
+			),
+		})
 	}
 }
 
 // Manual implementation to avoid extra boxing here
+// TODO: functions modifying peerset state could be modified to call peerset directly if the
+// `Multiaddr` only contains a `PeerId`
 impl NetworkPeers for Litep2pNetworkService {
-	fn set_authorized_peers(&self, _peers: HashSet<PeerId>) {
-		todo!();
+	fn set_authorized_peers(&self, peers: HashSet<PeerId>) {
+		let _ = self.cmd_tx.unbounded_send(NetworkServiceCommand::SetReservedPeers {
+			protocol: self.block_announce_protocol.clone(),
+			peers: peers
+				.into_iter()
+				.map(|peer| Multiaddr::empty().with(Protocol::P2p(peer.into())))
+				.collect(),
+		});
 	}
 
-	fn set_authorized_only(&self, _reserved_only: bool) {
-		todo!();
+	fn set_authorized_only(&self, reserved_only: bool) {
+		let _ = self.cmd_tx.unbounded_send(NetworkServiceCommand::SetReservedOnly {
+			protocol: self.block_announce_protocol.clone(),
+			reserved_only,
+		});
 	}
 
-	fn add_known_address(&self, _peer: PeerId, _address: Multiaddr) {
-		todo!();
+	fn add_known_address(&self, peer: PeerId, address: Multiaddr) {
+		let _ = self
+			.cmd_tx
+			.unbounded_send(NetworkServiceCommand::AddKnownAddress { peer, address });
 	}
 
-	fn report_peer(&self, _peer: PeerId, _cost_benefit: ReputationChange) {
-		todo!();
+	fn report_peer(&self, peer: PeerId, cost_benefit: ReputationChange) {
+		let _ = self
+			.cmd_tx
+			.unbounded_send(NetworkServiceCommand::ReportPeer { peer, cost_benefit });
 	}
 
-	fn disconnect_peer(&self, _peer: PeerId, _protocol: ProtocolName) {
-		todo!();
+	fn disconnect_peer(&self, peer: PeerId, protocol: ProtocolName) {
+		let _ = self
+			.cmd_tx
+			.unbounded_send(NetworkServiceCommand::DisconnectPeer { protocol, peer });
 	}
 
 	fn accept_unreserved_peers(&self) {
-		todo!();
+		let _ = self.cmd_tx.unbounded_send(NetworkServiceCommand::SetReservedOnly {
+			protocol: self.block_announce_protocol.clone(),
+			reserved_only: false,
+		});
 	}
 
 	fn deny_unreserved_peers(&self) {
-		todo!();
+		let _ = self.cmd_tx.unbounded_send(NetworkServiceCommand::SetReservedOnly {
+			protocol: self.block_announce_protocol.clone(),
+			reserved_only: true,
+		});
 	}
 
-	fn add_reserved_peer(&self, _peer: MultiaddrWithPeerId) -> Result<(), String> {
-		todo!();
+	fn add_reserved_peer(&self, peer: MultiaddrWithPeerId) -> Result<(), String> {
+		log::trace!(target: LOG_TARGET, "add reserved peer {peer:?} for block announce protocol");
+
+		let _ = self.cmd_tx.unbounded_send(NetworkServiceCommand::AddPeersToReservedSet {
+			protocol: self.block_announce_protocol.clone(),
+			peers: HashSet::from_iter([peer.concat()]),
+		});
+
+		Ok(())
 	}
 
-	fn remove_reserved_peer(&self, _peer: PeerId) {
-		todo!();
+	fn remove_reserved_peer(&self, peer: PeerId) {
+		log::trace!(target: LOG_TARGET, "remove reserved peer {peer:?} from block announce protocol");
+
+		let _ = self.cmd_tx.unbounded_send(NetworkServiceCommand::RemoveReservedPeers {
+			protocol: self.block_announce_protocol.clone(),
+			peers: HashSet::from_iter([peer]),
+		});
 	}
 
 	fn set_reserved_peers(
 		&self,
-		_protocol: ProtocolName,
-		_peers: HashSet<Multiaddr>,
+		protocol: ProtocolName,
+		peers: HashSet<Multiaddr>,
 	) -> Result<(), String> {
-		todo!();
+		let _ = self
+			.cmd_tx
+			.unbounded_send(NetworkServiceCommand::SetReservedPeers { protocol, peers });
+		Ok(())
 	}
 
 	fn add_peers_to_reserved_set(
 		&self,
-		_protocol: ProtocolName,
-		_peers: HashSet<Multiaddr>,
+		protocol: ProtocolName,
+		peers: HashSet<Multiaddr>,
 	) -> Result<(), String> {
-		todo!();
+		let _ = self
+			.cmd_tx
+			.unbounded_send(NetworkServiceCommand::AddPeersToReservedSet { protocol, peers });
+		Ok(())
 	}
 
 	fn remove_peers_from_reserved_set(
 		&self,
-		_protocol: ProtocolName,
-		_peers: Vec<PeerId>,
+		protocol: ProtocolName,
+		peers: Vec<PeerId>,
 	) -> Result<(), String> {
-		todo!();
+		let _ = self.cmd_tx.unbounded_send(NetworkServiceCommand::RemoveReservedPeers {
+			protocol,
+			peers: peers.into_iter().map(From::from).collect(),
+		});
+
+		Ok(())
 	}
 
 	fn sync_num_connected(&self) -> usize {
+		// TODO(aaro): implement
 		todo!();
 	}
 
@@ -196,18 +396,22 @@ impl NetworkPeers for Litep2pNetworkService {
 }
 
 impl NetworkEventStream for Litep2pNetworkService {
-	fn event_stream(&self, _stream_name: &'static str) -> BoxStream<'static, Event> {
-		todo!();
+	fn event_stream(&self, stream_name: &'static str) -> BoxStream<'static, Event> {
+		let (tx, rx) = out_events::channel(stream_name, 100_000);
+		let _ = self.cmd_tx.unbounded_send(NetworkServiceCommand::EventStream { tx });
+		Box::pin(rx)
 	}
 }
 
 impl NetworkStateInfo for Litep2pNetworkService {
 	fn external_addresses(&self) -> Vec<Multiaddr> {
-		todo!();
+		// TODO: implement properly
+		vec![]
 	}
 
 	fn listen_addresses(&self) -> Vec<Multiaddr> {
-		todo!();
+		// TODO: implement properly
+		vec![]
 	}
 
 	fn local_peer_id(&self) -> PeerId {
@@ -225,17 +429,43 @@ impl NetworkRequest for Litep2pNetworkService {
 		_request: Vec<u8>,
 		_connect: IfDisconnected,
 	) -> Result<Vec<u8>, RequestFailure> {
-		todo!();
+		unimplemented!();
 	}
 
 	fn start_request(
 		&self,
-		_peer: PeerId,
-		_protocol: ProtocolName,
-		_request: Vec<u8>,
-		_tx: oneshot::Sender<Result<Vec<u8>, RequestFailure>>,
-		_connect: IfDisconnected,
+		peer: PeerId,
+		protocol: ProtocolName,
+		request: Vec<u8>,
+		tx: oneshot::Sender<Result<Vec<u8>, RequestFailure>>,
+		connect: IfDisconnected,
 	) {
-		todo!();
+		let _ = self.cmd_tx.unbounded_send(NetworkServiceCommand::StartRequest {
+			peer,
+			protocol,
+			request,
+			tx,
+			connect,
+		});
+	}
+}
+
+// NOTE: not implemented by `litep2p`
+impl NetworkNotification for Litep2pNetworkService {
+	fn write_notification(&self, _: PeerId, protocol: ProtocolName, _: Vec<u8>) {
+		// log::error!(target: LOG_TARGET, "write_notificatoin called for {protocol:?}");
+		// unimplemented!();
+	}
+
+	fn notification_sender(
+		&self,
+		_: PeerId,
+		_: ProtocolName,
+	) -> Result<Box<dyn NotificationSender>, NotificationSenderError> {
+		unimplemented!();
+	}
+
+	fn set_notification_handshake(&self, _: ProtocolName, _: Vec<u8>) {
+		unimplemented!();
 	}
 }

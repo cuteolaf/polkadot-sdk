@@ -49,6 +49,7 @@ use sc_utils::mpsc::{tracing_unbounded, TracingUnboundedReceiver, TracingUnbound
 use sp_arithmetic::traits::SaturatedConversion;
 use std::{
 	collections::{HashMap, HashSet},
+	sync::Arc,
 	time::{Duration, Instant},
 };
 use wasm_timer::Delay;
@@ -288,7 +289,7 @@ pub struct ProtocolController {
 	to_notifications: TracingUnboundedSender<Message>,
 	/// `PeerStore` handle for checking peer reputation values and getting connection candidates
 	/// with highest reputation.
-	peer_store: Box<dyn PeerStoreProvider>,
+	peer_store: Arc<dyn PeerStoreProvider>,
 }
 
 impl ProtocolController {
@@ -297,7 +298,7 @@ impl ProtocolController {
 		set_id: SetId,
 		config: ProtoSetConfig,
 		to_notifications: TracingUnboundedSender<Message>,
-		peer_store: Box<dyn PeerStoreProvider>,
+		peer_store: Arc<dyn PeerStoreProvider>,
 	) -> (ProtocolHandle, ProtocolController) {
 		let (actions_tx, actions_rx) = tracing_unbounded("mpsc_api_protocol", 10_000);
 		let (events_tx, events_rx) = tracing_unbounded("mpsc_notifications_protocol", 10_000);

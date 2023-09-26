@@ -51,10 +51,8 @@ use schnellru::{ByLength, LruMap};
 use sc_client_api::{BlockBackend, HeaderBackend, ProofProvider};
 use sc_consensus::import_queue::ImportQueueService;
 use sc_network::{
-	config::{
-		FullNetworkConfiguration, NonReservedPeerMode, NotificationHandshake, ProtocolId, SetConfig,
-	},
-	peer_store::{PeerStoreHandle, PeerStoreProvider},
+	config::{FullNetworkConfiguration, NotificationHandshake, ProtocolId, SetConfig},
+	peer_store::PeerStoreProvider,
 	request_responses::{IfDisconnected, RequestFailure},
 	service::traits::{Direction, NotificationConfig, NotificationEvent, ValidationResult},
 	types::ProtocolName,
@@ -317,7 +315,7 @@ pub struct SyncingEngine<B: BlockT, Client> {
 	syncing_started: Option<Instant>,
 
 	/// Handle to `PeerStore`.
-	peer_store_handle: PeerStoreHandle,
+	peer_store_handle: Arc<dyn PeerStoreProvider>,
 
 	/// Instant when the last notification was sent or received.
 	last_notification_io: Instant,
@@ -363,7 +361,7 @@ where
 		block_downloader: Arc<dyn BlockDownloader<B>>,
 		state_request_protocol_name: ProtocolName,
 		warp_sync_protocol_name: Option<ProtocolName>,
-		peer_store_handle: PeerStoreHandle,
+		peer_store_handle: Arc<dyn PeerStoreProvider>,
 	) -> Result<(Self, SyncingService<B>, N::NotificationProtocolConfig), ClientError>
 	where
 		N: NetworkBackend<B, <B as BlockT>::Hash>,
@@ -455,6 +453,7 @@ where
 					.ok()
 					.flatten()
 					.expect("Genesis block exists; qed"),
+				&net_config.network_config.default_peers_set,
 			);
 		let block_announce_protocol_name = block_announce_config.protocol_name().clone();
 
@@ -889,6 +888,7 @@ where
 							target: LOG_TARGET,
 							"received notification from {peer} who had been earlier refused by `SyncingEngine`",
 						);
+						// debug_assert!(false);
 						continue
 					}
 
@@ -1103,6 +1103,8 @@ where
 		direction: Direction,
 	) -> Result<(), ()> {
 		log::trace!(target: LOG_TARGET, "New peer {peer_id} {status:?}");
+
+		// debug_assert!(!self.peers.contains_key(&peer_id));
 
 		let peer = Peer {
 			info: ExtendedPeerInfo {
@@ -1393,6 +1395,7 @@ where
 		best_number: NumberFor<B>,
 		best_hash: B::Hash,
 		genesis_hash: B::Hash,
+		set_config: &SetConfig,
 	) -> (N::NotificationProtocolConfig, Box<dyn NotificationService>) {
 		let block_announces_protocol = {
 			let genesis_hash = genesis_hash.as_ref();
@@ -1419,12 +1422,14 @@ where
 			))),
 			// NOTE: `set_config` will be ignored by `protocol.rs` as the block announcement
 			// protocol is still hardcoded into the peerset.
-			SetConfig {
-				in_peers: 0,
-				out_peers: 0,
-				reserved_nodes: Vec::new(),
-				non_reserved_mode: NonReservedPeerMode::Deny,
-			},
+			// TODO: update comment to reflect reality
+			set_config.clone(),
+			// SetConfig {
+			// 	in_peers: 0,
+			// 	out_peers: 0,
+			// 	reserved_nodes: Vec::new(),
+			// 	non_reserved_mode: NonReservedPeerMode::Deny,
+			// },
 		)
 	}
 

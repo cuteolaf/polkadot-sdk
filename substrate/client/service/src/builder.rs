@@ -43,8 +43,7 @@ use sc_executor::{
 use sc_keystore::LocalKeystore;
 use sc_network::{
 	config::{FullNetworkConfiguration, SyncMode},
-	peer_store::PeerStore,
-	service::traits::RequestResponseConfig,
+	service::traits::{PeerStore, RequestResponseConfig},
 	NetworkBackend, NetworkStateInfo, NetworkStatusProvider,
 };
 use sc_network_bitswap::BitswapRequestHandler;
@@ -866,7 +865,7 @@ where
 	net_config.add_notification_protocol(transactions_config);
 
 	// Create `PeerStore` and initialize it with bootnode peer ids.
-	let peer_store = PeerStore::new(
+	let peer_store = TNet::peer_store(
 		net_config
 			.network_config
 			.boot_nodes

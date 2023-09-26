@@ -34,7 +34,7 @@ pub use crate::{
 pub use libp2p::{identity::Keypair, multiaddr, Multiaddr};
 use sc_network_types::PeerId;
 
-use crate::{peer_store::PeerStoreHandle, service::traits::NetworkBackend};
+use crate::{peer_store::PeerStoreProvider, service::traits::NetworkBackend};
 use codec::Encode;
 use prometheus_endpoint::Registry;
 use zeroize::Zeroize;
@@ -57,6 +57,7 @@ use std::{
 	path::{Path, PathBuf},
 	pin::Pin,
 	str::{self, FromStr},
+	sync::Arc,
 };
 
 pub use libp2p::{
@@ -756,7 +757,7 @@ pub struct Params<Block: BlockT, H: ExHashT, N: NetworkBackend<Block, H>> {
 	pub network_config: FullNetworkConfiguration<Block, H, N>,
 
 	/// Peer store with known nodes, peer reputations, etc.
-	pub peer_store: PeerStoreHandle,
+	pub peer_store: Arc<dyn PeerStoreProvider>,
 
 	/// Legacy name of the protocol to use on the wire. Should be different for each chain.
 	pub protocol_id: ProtocolId,
