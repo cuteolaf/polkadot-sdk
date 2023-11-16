@@ -2324,7 +2324,7 @@ where
 /// Returns the number of the first block in the sequence.
 ///
 /// It is expected that `blocks` are in ascending order.
-fn validate_blocks<Block: BlockT>(
+pub fn validate_blocks<Block: BlockT>(
 	blocks: &Vec<BlockData<Block>>,
 	peer_id: &PeerId,
 	request: Option<BlockRequest<Block>>,
